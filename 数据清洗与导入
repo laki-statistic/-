@@ -1,0 +1,192 @@
+# -*- coding: utf-8 -*-
+"""
+Spyder Editor
+
+This is a temporary script file.
+"""
+#pip install pymysql
+#pip install mysql
+#pip install pandas SQLAlchemy mysql-connector
+import pymysql
+import pandas as pd
+import mysql.connector
+host = '172.25.0.48'  
+port = 3306           
+user = 'report_center_rw' 
+password = 'fc#c5NP0!@e5sGrD' 
+database = 'report_service' 
+from sqlalchemy import create_engine
+import pandas as pd
+from datetime import datetime
+#pip install kafka
+#from kafka import KafkaProducer
+
+# 从MySQL数据库中读取数据
+table_name = 'report_result_data_20240402'
+#data = pd.read_sql_table(table_name, engine)
+connection = mysql.connector.connect(
+        host='172.25.0.48',
+        port=3306,
+        user='report_center_rw',
+        password='fc#c5NP0!@e5sGrD',
+        database='report_service'
+    )
+
+if connection.is_connected():
+        print('Connected to MySQL database')
+cursor = connection.cursor()
+connect_timeout=300
+cursor.execute('SELECT id as report_id,user_account as account,name as report_name,method,request_time,request_data FROM report_result_data_20240402')
+rows = cursor.fetchall()
+#pip install json
+import json
+# 初始化一个空列表，用于存储解析后的JSON数据
+parsed_data = []
+etl_time = datetime.now()
+etl_time = int(etl_time.timestamp())
+for row in rows:
+    report_id, account, report_name, method, request_time, json_data = row
+    
+    try:
+        if isinstance(request_time, str):
+            # Convert string to datetime object
+            request_time = datetime.strptime(request_time, '%Y-%m-%d %H:%M:%S')
+        
+        # Format request_time as 'YYYY-MM-DD' if it's a datetime object
+        request_time = request_time.strftime('%Y-%m-%d')
+        parsed_json = json.loads(json_data)  # Parse JSON string
+        
+        # Extract infoFilters and dimensions
+        infoFilters = parsed_json.get('infoFilters', [])
+        dimensions = parsed_json.get('dimensions', [])
+        
+        # Extract and deduplicate 'field' values from infoFilters
+        field_values = {filter_item['field'] for filter_item in infoFilters if 'field' in filter_item}
+        
+        # Join the unique 'field' values into a comma-separated string
+        infoFilters = ', '.join(field_values)
+        
+
+        # Sort dimensions in descending order
+        dimensions.sort(reverse=True)
+        dimensions = ', '.join(dimensions)
+
+        # Store the information in a dictionary and add it to the parsed_data list
+        data_row = {
+            'report_id': report_id,
+            'account': account,
+            'report_name': report_name,
+            'method': method,
+            'request_time': request_time,
+            'infoFilters': infoFilters,  # Now a string of unique field names
+            'dimensions': dimensions,
+            'etl_time': etl_time  # Ensure etl_time is defined before this line
+        }
+        
+        parsed_data.append(data_row)
+        
+    except json.JSONDecodeError:
+        print(f"Error decoding JSON: {json_data}")
+    except ValueError as e:
+        print(f"Error processing date {request_time}: {e}")
+
+# 将解析后的数据转换成DataFrame
+df = pd.DataFrame(parsed_data)
+
+# 数据清洗：删除包含缺失值的行
+cleaned_df = df.dropna()
+cleaned_df.columns.tolist()
+# 显示清洗后的数据
+cleaned_df.head()
+#cleaned_df.to_sql(name='new_table_name', con=connection, index=False, if_exists='replace')
+#engine = create_engine('mysql+pymysql://user:password@host/database')
+#engine = create_engine(f'mysql+pymysql://{user}:{password}@{host}:{port}/{database}')
+#engine = create_engine('sqlite://', creator=lambda: connection)
+# 使用SQLAlchemy引擎将DataFrame写入新的表
+import sqlalchemy
+#engine = create_engine('mysql+pymysql://report_center_rw:fc#c5NP0!@e5sGrD@172.25.0.48:3306/report_service')
+#cleaned_df.to_sql('cleaned_table_name', con=engine, index=False, if_exists='replace')
+
+#conn = sqlalchemy.create_engine(f'mysql+pymysql://{user}:{password}@{host}:{port}/{database}')
+#cleaned_df.to_sql(name='report_result_data_cleaned__20240402', con=conn, index=False, if_exists='replace')
+
+config = {
+    'user': 'laki_wang',
+    'password': 'ZFhxuq#UWMPGpvpY',
+    'host': 'doris.tec-develop.com',
+    'port': 9030,
+    'database': 'ods_mb_mm',
+    'raise_on_warnings': True
+}
+
+# 连接到 Doris 数据库
+connection = mysql.connector.connect(**config)
+
+# 检查连接是否成功
+if connection.is_connected():
+    print('Connected to Doris database')
+
+# 创建一个 cursor 对象
+cursor = connection.cursor()
+
+# 准备插入数据的 SQL 语句
+insert_stmt = """
+INSERT INTO ods_mb_mm.ods_report_dl (report_id, account, report_name, method, request_time, infoFilters, dimensions, etl_time)
+VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+"""
+
+for index, row in cleaned_df.iterrows():
+    # JSON序列化列表字段
+    info_filters = str(row['infoFilters'])
+    dimensions = str(row['dimensions'])
+    
+    # 创建数据元组
+    data_tuple = (row['report_id'], row['account'], row['report_name'], row['method'], row['request_time'], info_filters, dimensions, row['etl_time'])
+    
+    # 执行 SQL 语句
+    try:
+        cursor.execute(insert_stmt, data_tuple)
+        connection.commit()
+    except Exception as e:
+        connection.rollback()
+        print(f"Failed to insert into database. Error: {e}")
+        
+   
+
+# 提交事务
+connection.commit()
+
+
+
+
+insert_aggregate_data_sql = """
+INSERT INTO ods_mb_mm.ods_report_use_test (report_name, report_date,dimensions,infoFilters,etl_time,count)
+SELECT
+    report_name,
+    request_time as report_date,
+    dimensions,
+    infoFilters,
+    etl_time,
+    COUNT(*) AS count
+FROM
+    ods_mb_mm.ods_report_dl
+GROUP BY
+    report_name,
+    report_date,
+    dimensions,
+    infoFilters;
+"""
+
+# 执行 SQL 语句
+cursor.execute(insert_aggregate_data_sql)
+connection.commit()  # 确保提交变更
+
+
+
+
+
+
+
+
+
+
