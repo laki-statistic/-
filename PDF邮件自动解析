@@ -1,0 +1,217 @@
+import json
+import logging
+import re
+import pdfplumber
+from pdfplumber.page import Page
+from datetime import datetime
+import os
+
+from fitz import fitz
+from working.common.authentications import get_kafka_hosts, get_wechat_email
+from working.framework.base_crawler import BaseCrawler
+from working.media.tiktok.model import TiktokEmailItem
+from working.sink.kafka_sink import KafkaSink
+from working.util.email_utils import EmailClass
+from working.util.notification_util import send_wechat_group_bot_msg
+
+logger = logging.getLogger(__name__)
+model1_1 = ['资源点位信息', '产品线', '投放国家', '售卖类型', '开始日期', '结束日期', '实际天数', '刊例总价', '折后总价', '币种']
+model1_2 = ['资源点位信息', '产品线', '投放国家', '售卖类型', '开始日期', '结束日期', '实际天数', '刊例总价', '折后总价', '币种', '备注']
+model1_3 = ['资源点位信息', '产品线', '投放国家', '售卖类型', '资源状态', '开始日期', '结束日期', '实际天数', '刊例总价', '折后总价', '币种']
+model1_4 = ['资源点位信息', '产品线', '售卖类型', '资源状态', '开始日期', '结束日期', '实际天数', '刊例总价', '折后总价', '币种']
+model2_1 = ['InventoryItemName', 'ProductLine', 'ReservationAdType', 'TakeoverType', 'TargetCountry', 'PurchasingType', 'StartDate', 'EndDate', 'Lastingdays', 'Impressions', 'PurchasingUnit', 'Rotation', 'Sov', 'Quantity', 'Rate', 'Discount', 'TotalRate', 'TotalPriceAfterDiscount', 'Currency', 'TargetAudience', 'Remarks', 'Investmentpackagename']
+model2_2 = ['InventoryItemName', 'ProductLine', 'ReservationAdType', 'TakeoverType', 'TargetCountry', 'PurchasingType', 'StartDate', 'EndDate', 'Lastingdays', 'Impressions', 'PurchasingUnit', 'Rotation', 'Sov', 'Quantity', 'Rate', 'Discount', 'TotalRate', 'TotalPriceAfterDiscount', 'Gross', 'Currency', 'TargetAudience', 'Remarks', 'Investmentpackagename']
+model2_3 = ['InventoryItemName', 'ProductLine', 'ReservationAdType', 'TakeoverType', 'TargetCountry', 'PurchasingType', 'StartDate', 'EndDate', 'Lastingdays', 'Impressions', 'PurchasingUnit', 'Rotation',  'Quantity', 'Rate', 'Discount', 'TotalRate', 'TotalPriceAfterDiscount', 'Currency', 'TargetAudience', 'Remarks', 'Investmentpackagename']
+model2_4 = ['InventoryItemName', 'ProductLine', 'ReservationAdType', 'TakeoverType', 'TargetCountry', 'PurchasingType', 'StartDate', 'EndDate', 'Lastingdays', 'Impressions', 'PurchasingUnit', 'Rotation',  'Quantity', 'Rate', 'Discount', 'TotalRate', 'TotalPriceAfterDiscount', 'Gross','Currency', 'TargetAudience', 'Remarks', 'Investmentpackagename']
+model2_5 = ['InventoryItemName', 'ProductLine', 'ReservationAdType', 'TakeoverType', 'TargetCountry', 'PurchasingType', 'StartDate', 'EndDate', 'Lastingdays', 'Impressions', 'PurchasingUnit', 'Rotation', 'Sov', 'Quantity', 'Rate', 'Discount', 'TotalRate', 'TotalPriceAfterDiscount','Gross','Net','Margin', 'Currency', 'TargetAudience', 'Remarks', 'Investmentpackagename']
+
+class TiktokEmailPDFCrawler(BaseCrawler):
+
+    def __init__(self):
+        super().__init__()
+        self.account_list = []
+        self.sink = KafkaSink(get_kafka_hosts(), "tiktok_email_report_doris_topic")
+        self.platform = 'tiktok'
+
+    def run(self):
+        mail_info = eval(get_wechat_email())
+        e = EmailClass(mail_info['username'], mail_info['password'], mail_info['config'])
+        start_date = datetime.strptime(self.app_param.startDate, "%Y-%m-%d")
+        assert (datetime.now() - start_date).days >= 0, "输入的开始时间有误"
+        end_date = datetime.strptime(self.app_param.endDate, "%Y-%m-%d")
+        if (datetime.now() - end_date).days <= 0:
+            # 结束日期是当天或者以后，则不设置end_time
+            mails = e.server.get_mails(start_time=start_date.strftime("%Y-%m-%d 00:00:00"),
+                                       subject="国际化广告订单")
+        else:
+            mails = e.server.get_mails(start_time=start_date.strftime("%Y-%m-%d 00:00:00"),
+                                       end_time=end_date.strftime("%Y-%m-%d 23:59:59"), subject="国际化广告订单")
+        for mail in mails:
+            # 遍历附件列表
+            for attachment in mail['attachments']:  # 返回字典，键为文件名，值为文件数据
+                if '.pdf' not in attachment[0]:
+                    continue
+                # 保存PDF附件到本地
+                content = attachment[1]
+                save_path = f'data/{attachment[0]}'
+                with open(save_path, 'wb') as file:
+                    file.write(content)
+                self.pdf_parse(save_path)
+
+
+
+    def delete_watermark(self, path):
+        '''去除水印'''
+        mark = b'bytedance'
+        pdf = fitz.open(path)
+        for page in pdf:
+            for xref in page.get_contents():
+                stream = pdf.xref_stream(xref).replace(mark, b'')
+                pdf.update_stream(xref, stream)
+        path = path.replace('.pdf', '_clean.pdf')
+        pdf.save(path)
+        pdf.close()
+        return path
+
+    def pdf_parse(self, path):
+        '''pdf解析'''
+        path = self.delete_watermark(path)
+        text_pdf = fitz.open(path)
+        table_pdf = pdfplumber.open(path)
+        serial=0
+        last_table_header = None
+        for i in range(text_pdf.page_count):
+            text_page = text_pdf.load_page(0)
+            table_page = table_pdf.pages[i]
+            item = TiktokEmailItem()
+            serial = serial+1
+            item.serial_id = serial
+            self.text_parse(text_page, item)
+            last_table_header = self.table_parse(table_page, item,i,last_table_header )
+
+        self.sink.flush()
+
+    def text_parse(self, page, item):
+        '''文本解析'''
+        lines = page.get_text().splitlines()
+
+        for index,value in enumerate(lines):
+            if ' : ' not in value:
+                continue
+
+            words = value.split(' : ')
+            if '订单编号' in words[0] or 'Order No.' in words[0]:
+                item.order_id = words[1]
+            elif '订单周期' in words[0] or 'Order Period' in words[0]:
+                item.order_cycle = words[1]
+            elif '订单总金额' in words[0] or 'Total Order Amount' in words[0]:
+                item.order_total_amount = words[1]
+            elif '代理客户名称' in words[0] or 'Agency Account Name' in words[0]:
+                item.proxy_client_name = words[1]
+            elif '商机(代理商)名称' in words[0]:
+                item.business_proxy_name = words[1]
+            elif '直客客户名称' in words[0] or 'Direct Account Name' in words[0]:
+                item.direct_client_name = words[1]
+            elif '商机(客户)名称' in words[0] or 'Opportunity(Direct) Name' in words[0]:
+                item.business_client_name = words[1]
+            elif '广告账户名称' in words[0] or 'Ad Account Name' in words[0]:
+                item.advertiser_account_name = words[1]
+                if re.findall(r'\(\d+\)', lines[index+1]):
+                    item.advertiser_account_name += lines[index+1]
+
+    def table_parse(self, page: Page, item: TiktokEmailItem,page_th,last_table_header ):
+        '''表格解析'''
+        table = page.extract_table()
+        if not table: return
+        table = [[i.replace('\n', '').replace(' ', '') for i in line] for line in table]
+        if page_th>0:
+            table = [last_table_header] + table
+            print(table)
+        if table[0] == model1_1 or table[0] == model1_2 or table[0] == model1_3 or table[0] == model1_4:
+            self.item_parse_1(table, item)
+        elif table[0] == model2_1 or table[0] == model2_2 or table[0] == model2_3 or table[0] == model2_4 or table[0] == model2_5:
+            self.item_parse_2(table, item)
+        else:
+            msg = f"解析TT国家化工单EMAIL邮件出现不兼容的PDF模板类型！"
+            logger.error(msg)
+            send_wechat_group_bot_msg(msg)
+            raise Exception(msg)
+        return table[0]
+
+
+    def item_parse_1(self, table, item: TiktokEmailItem):
+        '''数据解析1'''
+        #item.serial_id = 1
+
+        for line in table:
+            if line[1] != 'TikTok': continue
+
+            offset = 0
+            item.product_line = 'TikTok'
+            item.resource_location_info = line[0]
+            if table[0][3] == '资源状态':
+                item.put_in_countries = 'UNDEFINED'
+                item.sale_type = line[2]
+            else:
+                item.put_in_countries = line[2]
+                item.sale_type = line[3]
+            if table[0][4] == '资源状态': offset += 1
+            item.begin_date = line[offset + 4]
+            item.end_date = line[offset + 5]
+            item.real_days = line[offset + 6]
+            item.publication_total_price = float(line[offset + 7].replace(',', ''))
+            item.discount_total_price = float(line[offset + 8].replace(',', ''))
+            item.currency = line[offset + 9]
+
+            if not self.is_valid_date_format(item.begin_date) or not self.is_valid_date_format(item.end_date):
+                msg = f"报表日期解析错误, 请查询PDF信息具体排查！"
+                logger.error(msg)
+                send_wechat_group_bot_msg(msg)
+                raise Exception(msg)
+
+            logger.info(json.dumps(item.__dict__, ensure_ascii=False, default=lambda o: o.__dict__))
+            self.sink.sink(item)
+
+
+    def item_parse_2(self, table, item: TiktokEmailItem):
+        '''数据解析2'''
+        #item.serial_id = 1
+
+        for line in table:
+            if line[1] != 'TikTok': continue
+
+            offset = 0
+            item.product_line = 'TikTok'
+            item.resource_location_info = line[offset + 0]
+            item.put_in_countries = line[offset + 4]
+            item.sale_type = line[offset + 5]
+            item.begin_date = line[offset + 6]
+            item.end_date = line[offset + 7]
+            item.real_days = line[offset + 8]
+            if table[0][12] != 'Sov': offset -= 1
+            item.publication_total_price = float(line[offset + 16].replace(',', ''))
+            item.discount_total_price = float(line[offset + 17].replace(',', ''))
+            if table[0][18] == 'Gross' and table[0][19] == 'Currency': offset += 1
+            item.currency = line[offset + 18]
+            if table[0][18] == 'Gross' and table[0][19] != 'Currency': offset += 3
+            item.currency = line[offset + 18]
+
+            if not self.is_valid_date_format(item.begin_date) or not self.is_valid_date_format(item.end_date):
+                msg = f"报表日期解析错误, 请查询PDF信息具体排查！"
+                logger.error(msg)
+                send_wechat_group_bot_msg(msg)
+                raise Exception(msg)
+
+            logger.info(json.dumps(item.__dict__, ensure_ascii=False, default=lambda o: o.__dict__))
+            self.sink.sink(item)
+
+    def is_valid_date_format(self, date_string):
+        # 判断日期格式是否为 'yyyy-MM-dd'
+        return bool(re.match(r'\d{4}-\d{2}-\d{2}', date_string))
+
+
+if __name__ == '__main__':
+    tt = TiktokEmailPDFCrawler()
+    tt.app_param.startDate = '2024-06-04'
+    tt.app_param.endDate = '2024-06-04'
+    tt.run()
