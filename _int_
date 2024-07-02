@@ -1,0 +1,39 @@
+from working.common.base_item import BaseItem
+
+
+class NewsbreakItem(BaseItem):
+    report_date: str  # 日期
+    ad_account_id: str
+    ad_account_name: str
+    campaign_id: str
+    campaign_name: str
+    ad_set_id: str
+    ad_set_name: str
+    ad_id: str
+    ad_name: str
+    spend: float
+    impression: int  # 总展示次数
+    click: int  # 总点击次数
+    conversion: int  # 转化次数
+    spider_time: str  # 采集时间
+    data_source: int  # 数据来源
+
+    def get_dict(self):
+        return {
+            "report_date": self.report_date,
+            "ad_account_id": self.ad_account_id,
+            "ad_account_name": self.ad_account_name,
+            "campaign_id": self.campaign_id,
+            "campaign_name": self.campaign_name,
+            "ad_set_id": self.ad_set_id,
+            "ad_set_name": self.ad_set_name,
+            "ad_id": self.ad_id,
+            "ad_name": self.ad_name,
+            "spend": self.spend,
+            "impression": self.impression,
+            "click": self.click,
+            "conversion": self.conversion,
+            "spider_time": self.spider_time,
+            "data_source": self.data_source,
+        }
+
